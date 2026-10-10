@@ -1,0 +1,61 @@
+name: GitHub Trending Telegram digest
+
+on:
+  schedule:
+    - cron: '0 12 * * *' # 20:00 Asia/Shanghai; GitHub may delay/drop scheduled runs.
+  workflow_dispatch:
+    inputs:
+      send:
+        description: '发送今天的日报（仅配置完成后；默认只预览）'
+        required: true
+        type: boolean
+        default: false
+      recipient_verified:
+        description: '已核对 TELEGRAM_CHAT_ID 是自己的私人聊天（发送测试前勾选）'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read # Read previous attempts to avoid duplicate sends. No write scopes.
+
+concurrency:
+  group: telegram-digest-private-chat
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1; official release verified 2026-10-10
+        with:
+          persist-credentials: false
+      - name: Test (no credentials)
+        run: python3 -m unittest discover -s tests -v
+      - name: Build live preview (no credentials)
+        run: python3 digest.py build
+      - name: Show preview in job summary
+        run: |
+          python3 - <<'PYCODE'
+          import html, os
+          from pathlib import Path
+          preview = Path('out/preview.txt').read_text(encoding='utf-8')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('<h2>只读预览</h2><pre>' + html.escape(preview) + '</pre>')
+              f.write('<p>这是预览；简介按用户选择保留原文。未配置 secrets、核对收件人并选择发送前，不会发送。</p>')
+          PYCODE
+      # Keep this exact name: the script uses the step history as a conservative
+      # reservation. A failed/cancelled attempt may already have delivered.
+      - name: Delivery attempt (do not rename)
+        if: (github.event_name == 'schedule' && vars.DIGEST_ENABLED == 'true') || (github.event_name == 'workflow_dispatch' && inputs.send && inputs.recipient_verified)
+        env:
+          DIGEST_ENABLED: 'true' # Step gate above authorizes a verified manual test or enabled schedule.
+          DIGEST_LANGUAGE_MODE: 'original-approved' # User selected original descriptions.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 digest.py send

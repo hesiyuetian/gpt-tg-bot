@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       send:
-        description: '发送今天的日报（仅配置完成后；默认只预览）'
+        description: '手动测试发送今天的日报（默认只预览；与定时分别去重）'
         required: true
         type: boolean
         default: false
@@ -49,7 +49,8 @@ jobs:
               f.write('<p>这是预览；简介按用户选择保留原文。未配置 secrets、核对收件人并选择发送前，不会发送。</p>')
           PYCODE
       # Keep this exact name: the script uses the step history as a conservative
-      # reservation. A failed/cancelled attempt may already have delivered.
+      # reservation within schedule or workflow_dispatch separately. A failed
+      # or cancelled attempt may already have delivered; do not retry it.
       - name: Delivery attempt (do not rename)
         if: (github.event_name == 'schedule' && vars.DIGEST_ENABLED == 'true') || (github.event_name == 'workflow_dispatch' && inputs.send && inputs.recipient_verified)
         env:

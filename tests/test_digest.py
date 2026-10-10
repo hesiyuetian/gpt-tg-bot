@@ -16,7 +16,8 @@ NOW = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
 ENV = {"DIGEST_ENABLED": "true", "DIGEST_LANGUAGE_MODE": "original-approved",
        "TELEGRAM_BOT_TOKEN": "12345:" + "x" * 25, "TELEGRAM_CHAT_ID": "987654321",
        "GITHUB_ACTIONS": "true", "GITHUB_RUN_ATTEMPT": "1",
-       "GITHUB_REPOSITORY": "example/digest", "GITHUB_RUN_ID": "20"}
+       "GITHUB_REPOSITORY": "example/digest", "GITHUB_RUN_ID": "20",
+       "GITHUB_EVENT_NAME": "workflow_dispatch"}
 
 
 def fixture_projects():
@@ -150,17 +151,56 @@ class GateTests(unittest.TestCase):
 
 
 class DedupTests(unittest.TestCase):
-    def make_get(self, step=None, total_count=2):
+    def make_get(self, step=None, total_count=2, current_event="workflow_dispatch", previous_event="workflow_dispatch"):
         jobs = [{"steps": [step] if step else []}]
-        return Mock(side_effect=[{"workflow_id": 77},
-            {"total_count": total_count, "workflow_runs": [{"id": 20}, {"id": 19}]},
+        return Mock(side_effect=[{"workflow_id": 77, "event": current_event},
+            {"total_count": total_count, "workflow_runs": [{"id": 20, "event": current_event}, {"id": 19, "event": previous_event}]},
             {"total_count": 1, "jobs": jobs}])
 
     def test_previous_same_day_attempt_blocks_even_failure(self):
-        for conclusion in ["success", "failure", "cancelled", None]:
-            step = {"name": d.DELIVERY_STEP, "conclusion": conclusion, "started_at": "2026-10-10T11:00:00Z"}
-            with self.subTest(conclusion=conclusion), self.assertRaises(d.SafeError):
-                d.guard_github("2026-10-10", ENV, self.make_get(step))
+        for event in ["schedule", "workflow_dispatch"]:
+            for conclusion in ["success", "failure", "cancelled", None]:
+                step = {"name": d.DELIVERY_STEP, "conclusion": conclusion, "started_at": "2026-10-10T11:00:00Z"}
+                with self.subTest(event=event, conclusion=conclusion), self.assertRaises(d.SafeError):
+                    d.guard_github("2026-10-10", {**ENV, "GITHUB_EVENT_NAME": event}, self.make_get(step, current_event=event, previous_event=event))
+
+    def test_manual_test_and_schedule_have_separate_daily_reservations(self):
+        step = {"name": d.DELIVERY_STEP, "conclusion": "success", "started_at": "2026-10-10T02:40:20Z"}
+        for current, previous, kind in [("schedule", "workflow_dispatch", "scheduled"), ("workflow_dispatch", "schedule", "manual-test")]:
+            with self.subTest(current=current):
+                get = self.make_get(step, current_event=current, previous_event=previous)
+                self.assertEqual(d.guard_github("2026-10-10", {**ENV, "GITHUB_EVENT_NAME": current}, get), kind)
+                self.assertIn("filter=all", get.call_args.args[0])
+
+    def test_unknown_current_or_previous_event_fails_closed(self):
+        for event in [None, "push", "pull_request", ""]:
+            with self.subTest(current=event), self.assertRaises(d.SafeError):
+                d.guard_github("2026-10-10", {**ENV, "GITHUB_EVENT_NAME": event}, self.make_get(current_event=event))
+            with self.subTest(previous=event), self.assertRaises(d.SafeError):
+                d.guard_github("2026-10-10", ENV, self.make_get(previous_event=event))
+
+    def test_context_and_history_event_mismatches_fail_closed(self):
+        with self.assertRaises(d.SafeError):
+            d.guard_github("2026-10-10", {**ENV, "GITHUB_EVENT_NAME": "schedule"}, self.make_get())
+        get = Mock(side_effect=[{"workflow_id": 77, "event": "workflow_dispatch"},
+            {"total_count": 1, "workflow_runs": [{"id": 20, "event": "schedule"}]}])
+        with self.assertRaises(d.SafeError):
+            d.guard_github("2026-10-10", ENV, get)
+
+    def test_other_class_incomplete_history_still_fails_closed(self):
+        step = {"name": d.DELIVERY_STEP, "conclusion": "failure", "status": "completed"}
+        with self.assertRaises(d.SafeError):
+            d.guard_github("2026-10-10", ENV, self.make_get(step, previous_event="schedule"))
+
+    def test_inconsistent_run_or_job_counts_fail_closed(self):
+        current = {"workflow_id": 77, "event": "workflow_dispatch"}
+        runs = [{"id": 20, "event": "workflow_dispatch"}, {"id": 19, "event": "schedule"}]
+        for responses in [
+            [current, {"total_count": 1, "workflow_runs": runs}],
+            [current, {"total_count": 2, "workflow_runs": runs}, {"total_count": 1, "jobs": []}],
+        ]:
+            with self.subTest(responses=responses), self.assertRaises(d.SafeError):
+                d.guard_github("2026-10-10", ENV, Mock(side_effect=responses))
 
     def test_previous_skipped_step_allows(self):
         d.guard_github("2026-10-10", ENV, self.make_get({"name": d.DELIVERY_STEP, "conclusion": "skipped"}))
@@ -170,16 +210,17 @@ class DedupTests(unittest.TestCase):
         d.guard_github("2026-10-10", ENV, self.make_get(step))
 
     def test_rerun_and_non_actions_block(self):
-        for env in [{**ENV, "GITHUB_RUN_ATTEMPT": "2"}, {**ENV, "GITHUB_ACTIONS": "false"}]:
-            get = Mock()
-            with self.assertRaises(d.SafeError):
-                d.guard_github("2026-10-10", env, get)
-            get.assert_not_called()
+        for event in ["schedule", "workflow_dispatch"]:
+            for env in [{**ENV, "GITHUB_EVENT_NAME": event, "GITHUB_RUN_ATTEMPT": "2"}, {**ENV, "GITHUB_EVENT_NAME": event, "GITHUB_ACTIONS": "false"}]:
+                get = Mock()
+                with self.assertRaises(d.SafeError):
+                    d.guard_github("2026-10-10", env, get)
+                get.assert_not_called()
 
     def test_history_truncation_or_sync_delay_fails_closed(self):
         with self.assertRaises(d.SafeError):
             d.guard_github("2026-10-10", ENV, self.make_get(total_count=100))
-        get = Mock(side_effect=[{"workflow_id": 77}, {"total_count": 0, "workflow_runs": []}])
+        get = Mock(side_effect=[{"workflow_id": 77, "event": "workflow_dispatch"}, {"total_count": 0, "workflow_runs": []}])
         with self.assertRaises(d.SafeError):
             d.guard_github("2026-10-10", ENV, get)
 
@@ -236,20 +277,50 @@ class TransportTests(unittest.TestCase):
         p = payload()
         p["messages"] = ["one", "two", "three"]
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV, clear=True), \
-             patch.object(d, "validate_delivery"), patch.object(d, "guard_github"), \
+             patch.object(d, "validate_delivery"), patch.object(d, "guard_github", return_value="manual-test"), \
              patch.object(d, "datetime") as dt, patch.object(d.time, "sleep"), \
              patch.object(d, "send_message", side_effect=[None, d.SafeError("uncertain")]) as send:
             dt.now.return_value = NOW
             with self.assertRaises(d.SafeError):
                 d.deliver(p, tmp, NOW)
             self.assertEqual(send.call_count, 2)
-            state = json.loads((Path(tmp) / "2026-10-10.json").read_text())
+            state = json.loads((Path(tmp) / "2026-10-10.manual-test.json").read_text())
+            self.assertEqual(state["delivery_class"], "manual-test")
             self.assertEqual(state["confirmed_chunks"], 1)
             self.assertEqual(state["status"], "sending")
             # Local reservation also blocks an immediate restart.
             with self.assertRaises(d.SafeError):
                 d.deliver(p, tmp, NOW)
             self.assertEqual(send.call_count, 2)
+
+    def test_local_reservations_are_separate_and_each_class_blocks_repeats(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV, clear=True), \
+             patch.object(d, "validate_delivery"), \
+             patch.object(d, "guard_github", side_effect=["manual-test", "scheduled", "manual-test", "scheduled"]), \
+             patch.object(d, "datetime") as dt, patch.object(d, "send_message") as send, \
+             contextlib.redirect_stdout(io.StringIO()):
+            dt.now.return_value = NOW
+            d.deliver(payload(), tmp, NOW)
+            d.deliver(payload(), tmp, NOW)
+            self.assertEqual(send.call_count, 2)
+            for kind in ["manual-test", "scheduled"]:
+                state = json.loads((Path(tmp) / f"2026-10-10.{kind}.json").read_text())
+                self.assertEqual(state["delivery_class"], kind)
+                self.assertEqual(state["status"], "complete")
+                with self.assertRaises(d.SafeError):
+                    d.deliver(payload(), tmp, NOW)
+            self.assertEqual(send.call_count, 2)
+
+    def test_legacy_unclassified_local_reservation_blocks_both_classes(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV, clear=True), \
+             patch.object(d, "validate_delivery"), \
+             patch.object(d, "guard_github", side_effect=["manual-test", "scheduled"]), \
+             patch.object(d, "send_message") as send:
+            (Path(tmp) / "2026-10-10.json").write_text('{"status":"sending"}')
+            for kind in ["manual-test", "scheduled"]:
+                with self.subTest(kind=kind), self.assertRaises(d.SafeError):
+                    d.deliver(payload(), tmp, NOW)
+            send.assert_not_called()
 
     def test_get_retries_read_only_network_failures(self):
         with patch.object(d.OPENER, "open", side_effect=TimeoutError()) as request, patch.object(d.time, "sleep"):

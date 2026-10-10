@@ -14,7 +14,7 @@
 4. 预览正确后，再 Run workflow，勾选 `send` 和 `recipient_verified`。这会向所配置的私人聊天发送一次当天完整日报。核对 Telegram 实际收到的消息；失败时不要直接 Re-run，先看下方说明。
 5. 一次测试收件正确后，在 **Settings → Secrets and variables → Actions → Variables** 新建 `DIGEST_ENABLED`，值为 `true`。此后每天定时发送。暂停时改为 `false` 或删除这个变量。
 
-手动测试不需要提前启用定时。手动已发送当天日报后，当天的后续定时/手动发送会被保守去重；下一天正常继续。
+手动测试不需要提前启用定时。**手动测试与正式定时发送分别按北京时间日期去重**，同一天各自最多启动一次发送步骤。白天测试不会占用当天 20:00 的正式日报；当天再次手动测试、再次定时投递会各自被保守拦截，下一天正常继续。类别由 GitHub 的运行事件确认，不能通过输入任意类别来绕过。
 
 **不要把 token 放进 Git、聊天、截图、命令行参数、浏览器 URL 或第三方“获取 ID”网站。** Chat ID 也按隐私信息存放。本仓库公开；不要将任何私人内容写进源文件。只有两个 Telegram secrets 需要手动添加；`GITHUB_TOKEN` 由 Actions 自动提供且只读。
 
@@ -35,8 +35,8 @@
 - 只在最终发送步骤注入 Telegram secrets；测试和抓取不接触这些凭据。workflow 仅有 `contents: read` 和 `actions: read` 权限。
 - 仅调用 Telegram `sendMessage`，完全不调用 `getUpdates`、`setWebhook` 或 `deleteWebhook`。现有 bot 可继续使用原有服务；只是需要安全核对私聊 ID。
 - Telegram POST 每段仅尝试一次。超时、429、连接中断或异常响应立即停止，不自动重发；前面的分段或出错这一段可能已经到达，**先检查 Telegram**。不同分段间隔 1.2 秒。[Telegram API](https://core.telegram.org/bots/api#sendmessage)
-- 同一 workflow 串行运行，以只读 job 历史保守防重复。当天 `Delivery attempt (do not rename)` 步骤一旦启动，即使失败/取消，也视作“可能已发送”。已有 run 的 Re-run 不能发送。凭据错误也可能占用当天；修好后通常等下一天，确需补发时先核对实际收件再做有范围的恢复。
-- 这是尽力防重复，不是严格 exactly-once。删除运行历史、重建/复制 workflow、更名发送步骤或跨仓库运行会破坏判断，不要用这些操作绕过提示。历史不完整/尚未同步/超过检查上限时停止。
+- 同一 workflow 串行运行，以只读 job 历史保守防重复。当天**同类** `Delivery attempt (do not rename)` 步骤一旦启动，即使失败/取消，也视作“可能已发送”。已有 run 的 Re-run 不能发送。凭据错误也可能占用当天同类发送；修好后通常等下一天，确需补发时先核对实际收件再做有范围的恢复。不要切换测试/定时类别来重试结果不明的投递。
+- 这是尽力防重复，不是严格 exactly-once。删除运行历史、重建/复制 workflow、更名发送步骤或跨仓库运行会破坏判断，不要用这些操作绕过提示。事件未知、事件与上下文不一致、历史不完整/尚未同步/超过检查上限时停止。已有旧版运行通过原始事件分类；未分类的旧版本地发送记录仍安全拒绝。
 - GitHub **只读 GET** 临时失败可最多请求三次。空榜、HTML 结构变化、缺少 `stars today`、过期预览或 fixture 都停止；不拿总 stars 替代。
 - 失败会显示在 Actions；当前没有额外故障通知服务。不要开启包含原始 HTTP 请求或环境变量的调试日志。
 - 源码和 workflow 的修改者可能接触运行时 secrets，只给可信的人仓库写权限。唯一外部 Action 为官方 checkout，固定完整 SHA，禁用凭据持久化：[已核验提交 / v7.0.1](https://github.com/actions/checkout/commit/3d3c42e5aac5ba805825da76410c181273ba90b1)。升级时核对上游发布和 SHA。[GitHub 安全建议](https://docs.github.com/en/actions/reference/security/secure-use)

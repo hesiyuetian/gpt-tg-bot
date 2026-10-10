@@ -266,8 +266,16 @@ def github_get(path):
         raise SafeError("GitHub API 响应无效，无法检查重复发送。") from None
 
 
+def delivery_class(event):
+    if event == "schedule":
+        return "scheduled"
+    if event == "workflow_dispatch":
+        return "manual-test"
+    raise SafeError("运行事件未知；无法确认去重类别，已停止。")
+
+
 def guard_github(date, env=None, get=None):
-    """Conservative best effort: an earlier delivery step reserves this date.
+    """An earlier delivery step reserves this date within its event class.
 
     Serialized workflow + read-only history avoids repository write permissions.
     A started but failed/cancelled step may already have delivered, so block it.
@@ -281,6 +289,9 @@ def guard_github(date, env=None, get=None):
         raise SafeError("Actions 上下文不完整，无法检查重复发送。")
     base = f"/repos/{repo}/actions"
     current = get(f"{base}/runs/{run_id}")
+    kind = delivery_class(current.get("event"))
+    if current.get("event") != env.get("GITHUB_EVENT_NAME"):
+        raise SafeError("运行事件与 Actions 上下文不一致，已停止。")
     workflow_id = current.get("workflow_id")
     if not isinstance(workflow_id, int):
         raise SafeError("无法确认当前 workflow。")
@@ -290,20 +301,27 @@ def guard_github(date, env=None, get=None):
     query = urllib.parse.urlencode({"per_page": 100, "created": ">=" + start.strftime("%Y-%m-%dT%H:%M:%SZ")})
     data = get(f"{base}/workflows/{workflow_id}/runs?{query}")
     runs = data.get("workflow_runs")
-    if not isinstance(runs, list) or data.get("total_count", 101) >= 100:
+    if (not isinstance(runs, list) or data.get("total_count", 101) >= 100
+            or data.get("total_count") != len(runs)):
         raise SafeError("运行历史过多或不完整；为避免重复，已停止。")
+    if any(not isinstance(r, dict) for r in runs):
+        raise SafeError("运行历史包含无效记录，已停止。")
     if not any(str(r.get("id")) == run_id for r in runs):
         raise SafeError("运行历史尚未同步；为避免重复，已停止。")
     for run in runs:
+        other_kind = delivery_class(run.get("event"))
         other_id = run.get("id")
         if str(other_id) == run_id:
+            if other_kind != kind:
+                raise SafeError("当前运行历史的去重类别不一致，已停止。")
             continue
         if not isinstance(other_id, int):
             raise SafeError("运行历史包含无效记录，已停止。")
         # Read all attempts, not just the latest, which could be a skipped rerun.
         jobs_data = get(f"{base}/runs/{other_id}/jobs?filter=all&per_page=100")
         jobs = jobs_data.get("jobs")
-        if not isinstance(jobs, list) or jobs_data.get("total_count", 101) >= 100:
+        if (not isinstance(jobs, list) or jobs_data.get("total_count", 101) >= 100
+                or jobs_data.get("total_count") != len(jobs)):
             raise SafeError("任务历史不完整；为避免重复，已停止。")
         for job in jobs:
             steps = job.get("steps")
@@ -315,8 +333,10 @@ def guard_github(date, env=None, get=None):
                 started = step.get("started_at")
                 if not started and step.get("status") != "queued":
                     raise SafeError("发送步骤缺少时间记录；为避免重复，已停止。")
-                if started and parse_time(started).astimezone(SHANGHAI).date().isoformat() == date:
-                    raise SafeError("今天已有发送步骤启动，可能已送达或部分送达；已拦截重复发送，请先检查 Telegram。")
+                same_day = started and parse_time(started).astimezone(SHANGHAI).date().isoformat() == date
+                if same_day and other_kind == kind:
+                    raise SafeError("今天已有同类发送步骤启动，可能已送达或部分送达；已拦截重复发送，请先检查 Telegram。")
+    return kind
 
 
 def validate_delivery(payload, now, env=None):
@@ -369,11 +389,13 @@ def send_message(token, chat_id, text, opener=None):
 def deliver(payload, state_dir, now=None):
     now = now or datetime.now(timezone.utc)
     validate_delivery(payload, now)
-    guard_github(payload["date"])
+    kind = guard_github(payload["date"])
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
-    state_path = state_dir / (payload["date"] + ".json")
-    state = {"date": payload["date"], "status": "reserved", "confirmed_chunks": 0,
+    if (state_dir / (payload["date"] + ".json")).exists():
+        raise SafeError("本地已有未分类的当日发送记录；请先核对收件情况。")
+    state_path = state_dir / (payload["date"] + "." + kind + ".json")
+    state = {"date": payload["date"], "delivery_class": kind, "status": "reserved", "confirmed_chunks": 0,
              "total_chunks": len(payload["messages"])}
     try:
         with state_path.open("x", encoding="utf-8") as f:

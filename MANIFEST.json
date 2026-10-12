@@ -1,0 +1,21 @@
+{
+  "base_remote_commit": "d113b54c2e36fb2132360a14ddfbfcca2d745194",
+  "published": false,
+  "sha256": {
+    ".github/workflows/ashare.yml": "3ba6e91e9287027d9ae807c02efb5a41c078c073e391d0fce147166c4504a23d",
+    ".github/workflows/digest.yml": "fcd4147ea3e8d3b4e953948ccb8d8bea20707ff29aa9a6d13cca329289184132",
+    ".gitignore": "4aea21f40ad133ddfc3b23774245386b72424b93a97cb9fd78bdcbe80cfc99d7",
+    "README.md": "8f861efb26b0fe5b3a8110d0daacbd3043965be23f3b5df6e28726cdffb281a5",
+    "ashare.py": "706d978501bf5eb7a781b35f12f6b9cd861d7cf936bfdaa61348f55cfbc13318",
+    "chinese_overrides.json": "c5c24f7ca1c946fa4dfd44407409c8e11ec6e41f0e1c7c45bf8381b42afb31f1",
+    "config/ashare_calendar.json": "e7cbf137ac02e2e5aa3cdcfaaf693054eee2336bb4579ecdde0efaeab04d99fb",
+    "digest.py": "031b075f1d73801de2cffddf0d6c30cffd786fa0956f7c24efeba5a6a94f45eb",
+    "docs/ASHARE_BRIEF.md": "072fcd35039d82327390170a7a0af40ed3a08b181b6440951ddba3677b720e51",
+    "docs/UPDATE_VALIDATION.md": "49829c37eb1f2228a1bc3a761789a2895df960998087884b2d87400ea523fd0d",
+    "docs/VALIDATION.md": "3c03f38f0161d16ddaa702cc7b2bade00d5a658424426c26e3e1e9e1fdf010da",
+    "tests/fixtures/trending.html": "9bd8e3f3c80ac5aae9711d14c7cf8ad69672e3793174c2d7d2cae0044b2dde77",
+    "tests/test_ashare.py": "a75021e792ebe7fbf97186ea15a206e12a00e09b56caf525d247e89d83cd1fb3",
+    "tests/test_cycles.py": "3e3d474f48ee398bda575b5cb63c39118fec31aeafd279d1ddefe42d75de8105",
+    "tests/test_digest.py": "780268747b1eb76f426223c565ab0742c3feed8a771d2ee6b0a4d92b80199495"
+  }
+}

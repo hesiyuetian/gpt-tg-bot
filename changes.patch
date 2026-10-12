@@ -1,0 +1,852 @@
+diff --git a/.github/workflows/ashare.yml b/.github/workflows/ashare.yml
+new file mode 100644
+index 0000000..62ea5dd
+--- /dev/null
++++ b/.github/workflows/ashare.yml
+@@ -0,0 +1,46 @@
++name: A-share morning Telegram brief
++
++on:
++  schedule:
++    - cron: '0 2 * * 1-5' # 10:00 Asia/Shanghai; exchange calendar is checked in code.
++  workflow_dispatch: # Preview only; never sends Telegram.
++
++permissions:
++  contents: read
++  actions: read
++
++concurrency:
++  group: ashare-telegram-private-chat
++  cancel-in-progress: false
++
++jobs:
++  brief:
++    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
++    runs-on: ubuntu-24.04
++    timeout-minutes: 8
++    steps:
++      - name: Checkout
++        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
++        with:
++          persist-credentials: false
++      - name: Test without credentials
++        run: python3 -m unittest discover -s tests -v
++      - name: Build current brief or skip closed/late session
++        run: python3 ashare.py build
++      - name: Show preview
++        run: |
++          python3 - <<'PYCODE'
++          import html, os
++          from pathlib import Path
++          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
++              f.write('<h2>A股量价观察预览</h2><pre>' + html.escape(Path('out/ashare/preview.txt').read_text(encoding='utf-8')) + '</pre>')
++          PYCODE
++      # Existing history-based guard recognizes this exact name in this workflow.
++      - name: Delivery attempt (do not rename)
++        if: github.event_name == 'schedule' && vars.ASHARE_DISABLED != 'true'
++        env:
++          ASHARE_ENABLED: 'true'
++          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
++          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
++          GITHUB_TOKEN: ${{ github.token }}
++        run: python3 ashare.py send
+diff --git a/README.md b/README.md
+index 6b4d223..b0ab2db 100644
+--- a/README.md
++++ b/README.md
+@@ -55,3 +55,10 @@ python3 digest.py build --out out/live
+ 
+ 本地测试和真实 GitHub 抓取已验证；真实 Actions、Telegram 配对和收件需要按上方步骤完成，不能仅凭本地测试认为已上线成功。
+ 
++
++## 新增：A股早盘规则观察与跨日去重修复
++
++- A股有限观察池简报说明、时间安全与维护要求：[docs/ASHARE_BRIEF.md](docs/ASHARE_BRIEF.md)。手动工作流仅预览；默认分支的独立定时工作流沿用现有私聊secrets。
++- 晚间日报按最近已到达的北京时间20:00计划周期去重，实际抓取日期仍独立保留。凌晨延迟运行属于前一晚周期，不占当晚名额。
++- GitHub不提供可靠的原定cron日期；以run.created_at映射可观测周期，不能还原超过24小时延迟的原始计划。排队跨越20:00停止；历史旧运行的创建周期及实际发送步骤周期都保守保留，避免未知结果重发。手动测试仍按自然日单独去重。
++- Actions使用干净runner；不要未经核对复用旧版持久化 `delivery-state` 文件。旧版本地文件的自然日含义与新计划周期不同，迁移前需核对真实投递情况。
+diff --git a/ashare.py b/ashare.py
+new file mode 100644
+index 0000000..106daf2
+--- /dev/null
++++ b/ashare.py
+@@ -0,0 +1,252 @@
++#!/usr/bin/env python3
++"""Free, bounded-watchlist A-share morning rules brief; no trading or AI calls."""
++from __future__ import annotations
++import argparse
++from dataclasses import dataclass
++from datetime import date, datetime, time, timedelta, timezone
++import json
++import math
++import os
++from pathlib import Path
++import re
++import sys
++
++import digest as d
++
++SOURCE = 'https://qt.gtimg.cn/q='
++INDICES = ('sh000001', 'sz399001', 'sz399006')
++# A transparent finite sample across sectors, NOT a whole-market or personalized screen.
++WATCHLIST = ('sh600519', 'sz000858', 'sh601318', 'sh600036', 'sh601398',
++             'sh600900', 'sh601088', 'sh601857', 'sh600028', 'sh601012',
++             'sz300750', 'sz002594', 'sz000333', 'sh600030', 'sh600276',
++             'sh688981', 'sz002415', 'sh600309', 'sh601668', 'sh600406')
++CALENDAR = Path(__file__).with_name('config') / 'ashare_calendar.json'
++MAX_AGE = 180
++
++
++@dataclass(frozen=True)
++class Quote:
++    symbol: str
++    name: str
++    price: float
++    previous: float
++    open: float
++    change: float
++    high: float
++    low: float
++    volume_raw: float
++    amount_wan: float
++    volume_ratio: float | None
++    at: datetime
++
++
++def trading_day(day, calendar):
++    if calendar.get('schema') != 1 or calendar.get('year') != day.year:
++        raise d.SafeError('交易日历未覆盖当前年份，已停止；请先更新官方休市日历。')
++    try:
++        start, end = date.fromisoformat(calendar['valid_from']), date.fromisoformat(calendar['valid_until'])
++        holidays = {date.fromisoformat(v) for v in calendar['closed_dates']}
++        if not start <= day <= end or any(v.year != day.year for v in holidays):
++            raise ValueError
++    except (KeyError, TypeError, ValueError):
++        raise d.SafeError('交易日历格式或有效期无效，已停止。') from None
++    return day.weekday() < 5 and day not in holidays
++
++
++def in_window(now):
++    local = now.astimezone(d.SHANGHAI)
++    return time(10, 0) <= local.time().replace(tzinfo=None) <= time(10, 20)
++
++
++def numeric(value):
++    n = float(value)
++    if not math.isfinite(n):
++        raise ValueError
++    return n
++
++
++def parse_quotes(text, symbols, now):
++    """Tencent zero-based fields; turnover amount is 10,000 CNY.
++
++    Volume is kept raw: units vary by instrument (STAR board uses shares).
++    It is only checked for positivity, never used as a normalized ranking.
++
++    Each invalid/stale security is omitted. Mandatory index coverage is enforced
++    by build_payload. No cached quote or zero-price fallback is ever used.
++    """
++    parsed = {}
++    for symbol, raw in re.findall(r'v_((?:sh|sz)\d{6})="([^"\r\n]*)";', text):
++        if symbol not in symbols:
++            continue
++        if symbol in parsed:
++            raise d.SafeError('行情返回重复证券，已停止。')
++        f = raw.split('~')
++        try:
++            if len(f) < 50 or f[2] != symbol[2:]:
++                raise ValueError
++            at = datetime.strptime(f[30], '%Y%m%d%H%M%S').replace(tzinfo=d.SHANGHAI)
++            age = (now - at).total_seconds()
++            if not 0 <= age <= MAX_AGE or at.date() != now.astimezone(d.SHANGHAI).date():
++                raise ValueError
++            price, previous, opening = map(numeric, (f[3], f[4], f[5]))
++            change, high, low = map(numeric, (f[32], f[33], f[34]))
++            volume, amount = map(numeric, (f[36], f[57] if len(f) > 57 and f[57] else f[37]))
++            delta = numeric(f[31])
++            ratio = numeric(f[49]) if f[49] and numeric(f[49]) != 0 else None
++            if (min(price, previous, opening, high, low) <= 0 or volume <= 0 or amount <= 0
++                    or not low <= price <= high or not low <= opening <= high
++                    or abs(price - previous - delta) > .03
++                    or abs((price / previous - 1) * 100 - change) > .08
++                    or abs(change) > 45 or ratio is not None and ratio < 0):
++                raise ValueError
++            name = d.clean(f[1])[:20]
++            if not name:
++                raise ValueError
++            parsed[symbol] = Quote(symbol, name, price, previous, opening, change, high, low,
++                                    volume, amount, ratio, at)
++        except (ValueError, IndexError, OverflowError):
++            continue
++    return parsed
++
++
++def screen(quotes):
++    benchmark = quotes[INDICES[0]].change
++    eligible = []
++    for symbol in WATCHLIST:
++        q = quotes.get(symbol)
++        if q is None or any(x in q.name.upper() for x in ('ST', '退', 'N', 'C')):
++            continue
++        if (0.5 <= q.change <= 5 and q.price >= q.open and q.amount_wan >= 10000
++                and q.volume_ratio is not None and q.volume_ratio >= 1.2):
++            score = q.change - benchmark + min(q.volume_ratio, 3)
++            eligible.append((score, q))
++    return [q for _, q in sorted(eligible, key=lambda x: (-x[0], x[1].symbol))[:5]]
++
++
++def build_payload(text, now, calendar, *, fixture=False):
++    local = now.astimezone(d.SHANGHAI)
++    base = {'schema': 1, 'source': SOURCE, 'date': local.date().isoformat(),
++            'fetched_at': now.isoformat(), 'fixture': fixture}
++    if not trading_day(local.date(), calendar):
++        return {**base, 'status': 'skip', 'reason': '交易所休市，跳过。'}
++    if not in_window(now):
++        return {**base, 'status': 'skip', 'reason': '超出北京时间10:00–10:20窗口，跳过晚到任务，不补发。'}
++    quotes = parse_quotes(text, INDICES + WATCHLIST, now)
++    if any(s not in quotes for s in INDICES):
++        raise d.SafeError('指数行情缺失、过期或校验失败，未生成股票结论。')
++    coverage = sum(s in quotes for s in WATCHLIST)
++    if coverage < math.ceil(len(WATCHLIST) * .8):
++        raise d.SafeError('观察池有效行情不足80%，未生成股票结论。')
++    indices = [quotes[s] for s in INDICES]
++    candidates = screen(quotes)
++    if all(q.change >= .3 for q in indices):
++        scenario = '指数同步偏强。若继续守住今开且量能维持，关注强势延续；跌回今开下方则削弱此情景。'
++    elif all(q.change <= -.3 for q in indices):
++        scenario = '指数同步偏弱。若不能收复今开，继续防范回落；重新站回今开才考虑修复情景。'
++    else:
++        scenario = '指数分化或方向尚不明确。观察能否共同站稳今开；冲高回落时不追涨。'
++    blocks = [f'A股早盘量价观察｜{local:%Y-%m-%d %H:%M} 北京时间',
++              '免费公开行情规则简报，不是完整研究或全市场推荐。',
++              '指数快照：\n' + '\n'.join(f'{q.name} {q.price:.2f}（{q.change:+.2f}%），成交{q.amount_wan/10000:.1f}亿元' for q in indices),
++              '情景：' + scenario,
++              f'有限观察池：固定{len(WATCHLIST)}只，当前有效{coverage}只。筛选：涨幅0.5%–5%、不低于今开、成交≥1亿元、量比≥1.2。按相对上证涨幅+量比（上限3）排序，最多5只。']
++    if candidates:
++        blocks.append('观察名单（不足3只不凑数）：\n' + '\n'.join(
++            f'{i}. {q.name} {q.symbol[2:]}｜{q.price:.2f}元，{q.change:+.2f}%，成交{q.amount_wan/10000:.2f}亿元，腾讯量比{q.volume_ratio:.2f}\n'
++            f'观察条件：继续守住今开{q.open:.2f}；跌破时规则转弱。日内高点{q.high:.2f}附近注意冲高回落。'
++            for i, q in enumerate(candidates, 1)))
++    else:
++        blocks.append('当前没有满足全部条件的观察股，保持空名单。')
++    used = indices + candidates
++    blocks.append(f'行情时间：{min(q.at for q in used):%H:%M:%S}–{max(q.at for q in used):%H:%M:%S}（北京时间）；来源：腾讯财经公开行情 https://qt.gtimg.cn/ 。最多接受3分钟延迟，非交易所直连。')
++    blocks.append('风险：量比与短时涨幅可能失真，早盘信号会反转；本规则不含新闻、财报或估值核验。仅供观察，不构成个性化投资建议或买卖指令，不保证收益。')
++    message = '\n\n'.join(blocks)
++    if d.utf16_length(message) > 3900:
++        raise d.SafeError('简报超出单条消息限制，已停止。')
++    return {**base, 'status': 'ready', 'quote_times': [q.at.isoformat() for q in used],
++            'coverage': coverage, 'candidate_symbols': [q.symbol for q in candidates], 'message': message}
++
++
++def validate_send(payload, now, calendar, env):
++    if env.get('ASHARE_ENABLED') != 'true':
++        raise d.SafeError('A股发送未开启。')
++    if (payload.get('schema') != 1 or payload.get('source') != SOURCE or payload.get('fixture') is not False
++            or payload.get('status') != 'ready'):
++        raise d.SafeError('拒绝发送演示数据、跳过状态或未知格式。')
++    if not trading_day(now.astimezone(d.SHANGHAI).date(), calendar) or not in_window(now):
++        raise d.SafeError('非交易日或已超出早盘发送窗口，停止。')
++    age = (now - d.parse_time(payload.get('fetched_at'))).total_seconds()
++    if not 0 <= age <= 120 or payload.get('date') != now.astimezone(d.SHANGHAI).date().isoformat():
++        raise d.SafeError('简报已过期，停止。')
++    stamps = payload.get('quote_times')
++    if not isinstance(stamps, list) or len(stamps) < 3 or any(not 0 <= (now-d.parse_time(t)).total_seconds() <= MAX_AGE for t in stamps):
++        raise d.SafeError('行情在发送前已过期，停止。')
++    message = payload.get('message')
++    if not isinstance(message, str) or not message.strip() or d.utf16_length(message) > 3900:
++        raise d.SafeError('简报内容为空或过长。')
++    if not re.fullmatch(r'[0-9]+:[A-Za-z0-9_-]{20,}', env.get('TELEGRAM_BOT_TOKEN', '')):
++        raise d.SafeError('Telegram bot secret 缺失或格式无效。')
++    if not re.fullmatch(r'[1-9][0-9]*', env.get('TELEGRAM_CHAT_ID', '')):
++        raise d.SafeError('接收人必须是已核对的私人聊天ID。')
++
++
++def deliver(payload, calendar, state_dir, now=None):
++    now = now or datetime.now(timezone.utc)
++    validate_send(payload, now, calendar, os.environ)
++    kind, cycle = d.guard_github(payload['date'], schedule_hour=10, now=now, with_cycle=True)
++    if kind != 'scheduled':
++        raise d.SafeError('此功能手动运行仅预览；真实发送只允许定时任务。')
++    root = Path(state_dir)
++    root.mkdir(parents=True, exist_ok=True)
++    path = root / (cycle + '.ashare.json')
++    try:
++        with path.open('x', encoding='utf-8') as f:
++            json.dump({'cycle': cycle, 'status': 'reserved'}, f)
++    except FileExistsError:
++        raise d.SafeError('本周期已有发送记录，不盲目重试。') from None
++    # Revalidate after history lookup; never deliver a quote that expired meanwhile.
++    validate_send(payload, datetime.now(timezone.utc), calendar, os.environ)
++    d.send_message(os.environ['TELEGRAM_BOT_TOKEN'], os.environ['TELEGRAM_CHAT_ID'], payload['message'])
++    path.write_text(json.dumps({'cycle': cycle, 'status': 'confirmed'}), encoding='utf-8')
++    print('Telegram API 已确认1条A股观察简报；不代表用户已阅读。')
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('command', choices=('build', 'send'))
++    parser.add_argument('--input-quotes', type=Path, help='UTF-8 fixture; never sendable')
++    parser.add_argument('--out', type=Path, default=Path('out/ashare'))
++    args = parser.parse_args(argv)
++    try:
++        calendar = d.load_json(CALENDAR)
++        now = datetime.now(timezone.utc)
++        if args.command == 'build':
++            # Gate before the request, including unknown calendar years.
++            eligible = trading_day(now.astimezone(d.SHANGHAI).date(), calendar) and in_window(now)
++            text = ''
++            if eligible:
++                text = (args.input_quotes.read_text(encoding='utf-8') if args.input_quotes else
++                        d.get_bytes(SOURCE + ','.join(INDICES + WATCHLIST), limit=500000).decode('gb18030'))
++            now = datetime.now(timezone.utc) # Timestamp after the network response, not before it.
++            payload = build_payload(text, now, calendar, fixture=bool(args.input_quotes))
++            args.out.mkdir(parents=True, exist_ok=True)
++            (args.out/'brief.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
++            (args.out/'preview.txt').write_text(payload.get('message', payload.get('reason', '')), encoding='utf-8')
++            print('预览已生成；未发送。状态：' + payload['status'])
++        else:
++            payload = d.load_json(args.out/'brief.json')
++            if payload.get('status') == 'skip':
++                print('休市或超时，未发送。')
++            else:
++                deliver(payload, calendar, 'delivery-state/ashare')
++        return 0
++    except d.SafeError as exc:
++        print(str(exc), file=sys.stderr)
++        return 1
++    except Exception:
++        print('A股简报处理失败；不会发送未经校验的数据或自动重试消息。', file=sys.stderr)
++        return 1
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/config/ashare_calendar.json b/config/ashare_calendar.json
+new file mode 100644
+index 0000000..357c3fc
+--- /dev/null
++++ b/config/ashare_calendar.json
+@@ -0,0 +1,47 @@
++{
++  "schema": 1,
++  "year": 2026,
++  "valid_from": "2026-01-01",
++  "valid_until": "2026-12-31",
++  "closed_dates": [
++    "2026-01-01",
++    "2026-01-02",
++    "2026-01-03",
++    "2026-02-15",
++    "2026-02-16",
++    "2026-02-17",
++    "2026-02-18",
++    "2026-02-19",
++    "2026-02-20",
++    "2026-02-21",
++    "2026-02-22",
++    "2026-02-23",
++    "2026-04-04",
++    "2026-04-05",
++    "2026-04-06",
++    "2026-05-01",
++    "2026-05-02",
++    "2026-05-03",
++    "2026-05-04",
++    "2026-05-05",
++    "2026-06-19",
++    "2026-06-20",
++    "2026-06-21",
++    "2026-09-25",
++    "2026-09-26",
++    "2026-09-27",
++    "2026-10-01",
++    "2026-10-02",
++    "2026-10-03",
++    "2026-10-04",
++    "2026-10-05",
++    "2026-10-06",
++    "2026-10-07"
++  ],
++  "sources": [
++    "https://www.sse.com.cn/disclosure/announcement/general/c/c_20251222_10802507.shtml",
++    "https://www.szse.cn/disclosure/notice/general/t20251222_618087.html"
++  ],
++  "verified_on": "2026-10-12",
++  "note": "All Saturdays and Sundays are closed, including government make-up workdays. Unknown years fail closed."
++}
+diff --git a/digest.py b/digest.py
+index 4843715..a6a7650 100644
+--- a/digest.py
++++ b/digest.py
+@@ -274,8 +274,20 @@ def delivery_class(event):
+     raise SafeError("运行事件未知；无法确认去重类别，已停止。")
+ 
+ 
+-def guard_github(date, env=None, get=None):
+-    """An earlier delivery step reserves this date within its event class.
++def scheduled_cycle(at, hour=20):
++    """Most recent Shanghai schedule boundary, not the quote/fetch date.
++
++    GitHub does not expose the intended cron occurrence. Bind to run.created_at
++    so queueing and reruns cannot move a reservation. Delays of >=24 hours
++    cannot be reconstructed; this is a conservative observable cycle policy.
++    """
++    local = at.astimezone(SHANGHAI)
++    boundary = local.replace(hour=hour, minute=0, second=0, microsecond=0)
++    return (local.date() if local >= boundary else (local - timedelta(days=1)).date()).isoformat()
++
++
++def guard_github(date, env=None, get=None, *, schedule_hour=20, now=None, with_cycle=False):
++    """An earlier delivery step reserves its run cycle within its event class.
+ 
+     Serialized workflow + read-only history avoids repository write permissions.
+     A started but failed/cancelled step may already have delivered, so block it.
+@@ -292,6 +304,9 @@ def guard_github(date, env=None, get=None):
+     kind = delivery_class(current.get("event"))
+     if current.get("event") != env.get("GITHUB_EVENT_NAME"):
+         raise SafeError("运行事件与 Actions 上下文不一致，已停止。")
++    cycle = scheduled_cycle(parse_time(current.get("created_at")), schedule_hour) if kind == "scheduled" else date
++    if now is not None and kind == "scheduled" and cycle != scheduled_cycle(now, schedule_hour):
++        raise SafeError("运行排队跨越计划周期，已停止，避免占用下一周期或重复投递。")
+     workflow_id = current.get("workflow_id")
+     if not isinstance(workflow_id, int):
+         raise SafeError("无法确认当前 workflow。")
+@@ -333,10 +348,20 @@ def guard_github(date, env=None, get=None):
+                 started = step.get("started_at")
+                 if not started and step.get("status") != "queued":
+                     raise SafeError("发送步骤缺少时间记录；为避免重复，已停止。")
+-                same_day = started and parse_time(started).astimezone(SHANGHAI).date().isoformat() == date
+-                if same_day and other_kind == kind:
+-                    raise SafeError("今天已有同类发送步骤启动，可能已送达或部分送达；已拦截重复发送，请先检查 Telegram。")
+-    return kind
++                # Validate even the other event class; incomplete history fails closed.
++                if started:
++                    step_time = parse_time(started)
++                    other_cycle = (scheduled_cycle(parse_time(run.get("created_at")), schedule_hour)
++                                   if other_kind == "scheduled" else step_time.astimezone(SHANGHAI).date().isoformat())
++                else:
++                    other_cycle = None
++                # Legacy code could send after its creation cycle ended. Its
++                # actual delivery cycle also remains reserved conservatively.
++                actual_cycle = (scheduled_cycle(step_time, schedule_hour)
++                                if started and other_kind == "scheduled" else other_cycle)
++                if cycle in (other_cycle, actual_cycle) and other_kind == kind:
++                    raise SafeError("本计划周期已有同类发送步骤启动，可能已送达或部分送达；已拦截重复发送，请先检查 Telegram。")
++    return (kind, cycle) if with_cycle else kind
+ 
+ 
+ def validate_delivery(payload, now, env=None):
+@@ -389,13 +414,13 @@ def send_message(token, chat_id, text, opener=None):
+ def deliver(payload, state_dir, now=None):
+     now = now or datetime.now(timezone.utc)
+     validate_delivery(payload, now)
+-    kind = guard_github(payload["date"])
++    kind, cycle = guard_github(payload["date"], now=now, with_cycle=True)
+     state_dir = Path(state_dir)
+     state_dir.mkdir(parents=True, exist_ok=True)
+     if (state_dir / (payload["date"] + ".json")).exists():
+         raise SafeError("本地已有未分类的当日发送记录；请先核对收件情况。")
+-    state_path = state_dir / (payload["date"] + "." + kind + ".json")
+-    state = {"date": payload["date"], "delivery_class": kind, "status": "reserved", "confirmed_chunks": 0,
++    state_path = state_dir / (cycle + "." + kind + ".json")
++    state = {"date": payload["date"], "cycle": cycle, "delivery_class": kind, "status": "reserved", "confirmed_chunks": 0,
+              "total_chunks": len(payload["messages"])}
+     try:
+         with state_path.open("x", encoding="utf-8") as f:
+@@ -406,6 +431,8 @@ def deliver(payload, state_dir, now=None):
+         # Stop rather than let a day-boundary split evade the date guard.
+         if datetime.now(timezone.utc).astimezone(SHANGHAI).date().isoformat() != payload["date"]:
+             raise SafeError("发送跨越北京时间午夜，已停止剩余分段，请核对收件情况。")
++        if kind == "scheduled" and scheduled_cycle(datetime.now(timezone.utc)) != cycle:
++            raise SafeError("发送跨越计划周期，已停止剩余分段，请核对收件情况。")
+         state["status"] = "sending"
+         state_path.write_text(json.dumps(state), encoding="utf-8")
+         send_message(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"], message)
+diff --git a/docs/ASHARE_BRIEF.md b/docs/ASHARE_BRIEF.md
+new file mode 100644
+index 0000000..5e63355
+--- /dev/null
++++ b/docs/ASHARE_BRIEF.md
+@@ -0,0 +1,34 @@
++# A 股早盘 Telegram 量价观察
++
++## 行为与范围
++
++新增独立工作流 `.github/workflows/ashare.yml`，北京时间工作日 10:00 触发（UTC 02:00），并用沪深交易所2026年度官方休市公告跳过休市日。调休周末仍休市。未核验的2027年及以后会停止，不会假设所有工作日开市；年底前应更新日历。
++
++GitHub Actions 可能延迟或漏触发。只有北京时间10:00–10:20允许构建和发送；超过窗口直接跳过，不在几小时后补发“早盘”结论。因此该免费调度方式不能保证准点或每天一定送达。年度日历不能预知临时休市；可暂停工作流，或把仓库变量 `ASHARE_DISABLED` 设为 `true` 紧急停发。恢复时删除该变量或设为 `false`。
++
++只读取现有 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` secrets，沿用已核对的私人聊天，不更改凭证、权限、晚间GitHub日报和独立邮件任务。不调用付费AI，不交易。发布本工作流到默认分支即配置定时发送；手动 `Run workflow` 永远只预览，不发送。
++
++## 行情与规则
++
++腾讯财经免费公开接口 `https://qt.gtimg.cn/q=`；非交易所直连，也没有稳定API契约保证。全流程不缓存旧行情作为当前行情，不下载新闻或引入额外模型。
++
++- 指数：上证指数、深证成指、创业板指。逐一展示成交额，不把重叠口径相加成两市成交额。
++- 固定20只观察池在 `ashare.py` 的 `WATCHLIST` 列出，跨多个行业但不是全市场、指数成分完整样本或个性化投资组合。选择是工程默认样本，不代表投资优先级。
++- 校验证券代码、有限数值、价格/涨跌幅/涨跌额一致性、当前日期、行情年龄最多180秒；指数缺一即停止。个股无效则剔除，有效覆盖不足80%停止。
++- 腾讯字段以0起下标计算：现价3、昨收4、今开5、时间30、涨跌额31、涨跌幅32、高低33/34、原始成交量36、成交额57（万元，缺失时37取整万元）、量比49。成交量单位随证券类型不同，不归一、不参与排名，仅验证为正；0量比按不可用处理。
++- 候选规则：涨幅0.5%–5%，现价不低于今开，成交额至少1亿元，腾讯量比至少1.2，剔除ST/退市等特殊名称。
++- 排序：相对上证的涨幅百分点 + min(腾讯量比, 3)，并以代码固定破同分。最多5只；不足3只如实少列，无信号保持空名单。
++- 指数情景仅说明同步走强、同步偏弱或分化时的观察条件，不是可靠预测。候选给出今开参考与回落风险，没有目标价或收益承诺。
++- 发送前重新检查工作日、时间窗口、payload年龄≤120秒和行情≤180秒。失败时Actions报错或跳过；不会为了发送而造数据。没有单独故障TG通知。
++
++## 日历与字段依据
++
++- https://www.sse.com.cn/disclosure/announcement/general/c/c_20251222_10802507.shtml
++- https://www.szse.cn/disclosure/notice/general/t20251222_618087.html
++- 腾讯官网股票页加载的行情字段映射脚本（2026-10-12验证）：https://st.gtimg.com/quotes/hs-fund/bundle.13362df9.js
++
++## 验证状态
++
++2026-10-12北京时间09:32对3指数与20只观察股做只读实时解析，23/23通过。该检查只证明当时字段可用，不证明10:00的时效、GitHub Actions网络可用或Telegram投递已成功。盘前/过期fixture不能发送。
++
++示例与单测使用合成行情，不应视为市场观点。正式上线还需远端提交、Actions识别和首次实际定时运行结果核验。
+diff --git a/docs/UPDATE_VALIDATION.md b/docs/UPDATE_VALIDATION.md
+new file mode 100644
+index 0000000..cd143d9
+--- /dev/null
++++ b/docs/UPDATE_VALIDATION.md
+@@ -0,0 +1,21 @@
++# 2026-10-12 更新验证
++
++基线：远端 main `d113b54c2e36fb2132360a14ddfbfcca2d745194`。
++
++## 已验证
++
++- Python标准库实现，无新增运行时依赖。
++- 78项单测通过：原45项回归与33项跨日周期、行情、日历、筛选、过期拦截、手动不发送、未知发送不重试等检查。
++- Python编译检查通过。
++- 两份工作流YAML解析通过；晚间工作流内容保持不变。
++- 只读实时字段检查：2026-10-12 09:32北京时间，3指数+20观察股23/23通过。09:32不在发送窗口，构建返回skip。
++- 去重只读复核修正了旧运行跨20:00发送时的双周期保留；跨20:00分段停止有测试。
++
++## 尚未验证或执行
++
++- GitHub连接器实际写入仍返回403 Resource not accessible by integration；本包不是远端已提交证明。
++- 未触发真实Telegram测试，未改secrets、权限或独立邮件任务。
++- 未运行远端CI或正式A股定时任务，未确认真实10:00数据/投递。
++- 股价/量比规则不是投资研究质量的回测验证；不保证预测准确或收益。
++
++日历仅覆盖2026，未知年份安全停止。GitHub Actions运行可能晚于20分钟窗口并被跳过，这比发送迟到的早盘建议更安全。
+diff --git a/tests/test_ashare.py b/tests/test_ashare.py
+new file mode 100644
+index 0000000..38fb974
+--- /dev/null
++++ b/tests/test_ashare.py
+@@ -0,0 +1,166 @@
++from datetime import date, datetime, timedelta, timezone
++import json
++import os
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import Mock, patch
++import ashare as a
++import digest as d
++from test_digest import ENV
++
++NOW = datetime(2026, 10, 12, 2, 0, 10, tzinfo=timezone.utc)
++CAL = d.load_json(a.CALENDAR)
++
++
++def line(symbol, **overrides):
++    f = [''] * 60
++    values = {1: '示例证券', 2: symbol[2:], 3: '10.10', 4: '10.00', 5: '10.05', 6: '200000',
++              30: '20261012100000', 31: '0.10', 32: '1.00', 33: '10.2', 34: '9.9',
++              36: '200000', 37: '20200', 49: '1.5', 57: '20200.55'}
++    values.update({int(k): v for k, v in overrides.items()})
++    for k, v in values.items():
++        f[k] = str(v)
++    return f'v_{symbol}="' + '~'.join(f) + '";'
++
++
++def raw():
++    return '\n'.join(line(s) for s in a.INDICES + a.WATCHLIST)
++
++
++def payload():
++    return a.build_payload(raw(), NOW, CAL)
++
++
++class CalendarTests(unittest.TestCase):
++    def test_weekends_and_makeup_workdays_closed(self):
++        for day in ['2026-10-10', '2026-02-14', '2026-02-28', '2026-09-20']:
++            self.assertFalse(a.trading_day(date.fromisoformat(day), CAL))
++
++    def test_official_holidays_closed(self):
++        for day in CAL['closed_dates']:
++            self.assertFalse(a.trading_day(date.fromisoformat(day), CAL))
++
++    def test_october_ninth_and_twelfth_open(self):
++        for day in ['2026-10-09', '2026-10-12']:
++            self.assertTrue(a.trading_day(date.fromisoformat(day), CAL))
++
++    def test_unknown_year_and_malformed_calendar_fail_closed(self):
++        for day, cal in [(date(2027,1,4), CAL), (date(2026,10,12), {}),
++                         (date(2026,10,12), {**CAL, 'closed_dates': ['bad']})]:
++            with self.assertRaises(d.SafeError):
++                a.trading_day(day, cal)
++
++    def test_closed_day_and_late_schedule_skip(self):
++        for now in [NOW + timedelta(days=5), NOW + timedelta(minutes=21), NOW - timedelta(minutes=1)]:
++            self.assertEqual(a.build_payload('', now, CAL)['status'], 'skip')
++
++
++class QuoteTests(unittest.TestCase):
++    def test_fields_and_units(self):
++        q = a.parse_quotes(line('sh600519'), a.WATCHLIST, NOW)['sh600519']
++        self.assertEqual(q.price, 10.1)
++        self.assertEqual(q.amount_wan, 20200.55)
++        self.assertEqual(q.volume_raw, 200000)
++        self.assertEqual(q.volume_ratio, 1.5)
++        self.assertEqual(q.at.hour, 10)
++
++    def test_rounded_amount_fallback(self):
++        q = a.parse_quotes(line('sh600519', **{'57': ''}), a.WATCHLIST, NOW)['sh600519']
++        self.assertEqual(q.amount_wan, 20200)
++
++    def test_old_future_malformed_and_wrong_symbol_quotes_omitted(self):
++        for fields in [{'30':'20261009100000'}, {'30':'20261012100100'}, {'30':'bad'},
++                       {'2':'000001'}, {'3':'nan'}, {'31':'9'}, {'32':'99'},
++                       {'3':'0'}, {'36':'0'}, {'57':'-3'}, {'49':'-1'}]:
++            with self.subTest(fields=fields):
++                self.assertEqual(a.parse_quotes(line('sh600519', **fields), a.WATCHLIST, NOW), {})
++
++    def test_zero_volume_ratio_is_unavailable(self):
++        q = a.parse_quotes(line('sh600519', **{'49':'0'}), a.WATCHLIST, NOW)['sh600519']
++        self.assertIsNone(q.volume_ratio)
++
++    def test_duplicate_security_fails_closed(self):
++        with self.assertRaises(d.SafeError):
++            a.parse_quotes(line('sh600519') * 2, a.WATCHLIST, NOW)
++
++    def test_missing_any_index_blocks_whole_brief(self):
++        for symbol in a.INDICES:
++            with self.assertRaises(d.SafeError):
++                a.build_payload(raw().replace(line(symbol), ''), NOW, CAL)
++
++    def test_insufficient_pool_coverage_blocks(self):
++        with self.assertRaises(d.SafeError):
++            a.build_payload('\n'.join(line(s) for s in a.INDICES + a.WATCHLIST[:15]), NOW, CAL)
++
++    def test_stale_stock_omitted_with_coverage_disclosure(self):
++        p = a.build_payload(raw().replace(line(a.WATCHLIST[0]), line(a.WATCHLIST[0], **{'30':'20261011100000'})), NOW, CAL)
++        self.assertEqual(p['coverage'], 19)
++        self.assertNotIn(a.WATCHLIST[0], p['candidate_symbols'])
++
++    def test_bound_five_and_disclose_scope_risk_and_timestamp(self):
++        p = payload()
++        self.assertEqual(len(p['candidate_symbols']), 5)
++        for text in ['固定20只', '不是完整研究或全市场推荐', '不保证收益', '10:00:00', '腾讯量比']:
++            self.assertIn(text, p['message'])
++        self.assertLess(d.utf16_length(p['message']), 3900)
++
++    def test_empty_pool_signals_never_force_candidates(self):
++        p = a.build_payload(raw().replace('~1.5~', '~0~'), NOW, CAL)
++        self.assertEqual(p['candidate_symbols'], [])
++        self.assertIn('保持空名单', p['message'])
++
++    def test_st_and_low_amount_filtered(self):
++        modified = raw()
++        for s in a.WATCHLIST:
++            modified = modified.replace(line(s), line(s, **{'1':'ST示例'}))
++        self.assertEqual(a.build_payload(modified, NOW, CAL)['candidate_symbols'], [])
++
++
++class SendingTests(unittest.TestCase):
++    def env(self):
++        return {**ENV, 'ASHARE_ENABLED':'true', 'GITHUB_EVENT_NAME':'schedule'}
++
++    def test_good_payload_validates_without_sending(self):
++        a.validate_send(payload(), NOW, CAL, self.env())
++
++    def test_disabled_fixture_stale_and_group_rejected(self):
++        for p, now, env in [(payload(), NOW, ENV), ({**payload(), 'fixture':True}, NOW, self.env()),
++                            (payload(), NOW+timedelta(seconds=121), self.env()),
++                            (payload(), NOW, {**self.env(), 'TELEGRAM_CHAT_ID':'-42'})]:
++            with self.subTest(), self.assertRaises(d.SafeError):
++                a.validate_send(p, now, CAL, env)
++
++    def test_quotes_expire_even_when_payload_new(self):
++        p = payload(); p['quote_times'][0] = (NOW-timedelta(seconds=181)).isoformat()
++        with self.assertRaises(d.SafeError):
++            a.validate_send(p, NOW, CAL, self.env())
++
++    def test_manual_never_sends(self):
++        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, self.env()), \
++             patch.object(d, 'guard_github', return_value=('manual-test','2026-10-12')), patch.object(d, 'send_message') as send:
++            with self.assertRaises(d.SafeError):
++                a.deliver(payload(), CAL, tmp, NOW)
++            send.assert_not_called()
++
++    def test_uncertain_delivery_reserved_and_not_retried(self):
++        p = payload()
++        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, self.env()), \
++             patch.object(d, 'guard_github', return_value=('scheduled','2026-10-12')), \
++             patch.object(a, 'datetime') as clock, patch.object(d, 'send_message', side_effect=d.SafeError('uncertain')) as send:
++            clock.now.return_value = NOW
++            for _ in range(2):
++                with self.assertRaises(d.SafeError):
++                    a.deliver(p, CAL, tmp, NOW)
++            self.assertEqual(send.call_count, 1)
++            self.assertEqual(json.loads((Path(tmp)/'2026-10-12.ashare.json').read_text())['status'], 'reserved')
++
++    def test_freshness_rechecked_after_history_lookup(self):
++        p = payload()
++        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, self.env()), \
++             patch.object(d, 'guard_github', return_value=('scheduled','2026-10-12')), \
++             patch.object(a, 'datetime') as clock, patch.object(d, 'send_message') as send:
++            clock.now.return_value = NOW + timedelta(minutes=4)
++            with self.assertRaises(d.SafeError):
++                a.deliver(p, CAL, tmp, NOW)
++            send.assert_not_called()
+diff --git a/tests/test_cycles.py b/tests/test_cycles.py
+new file mode 100644
+index 0000000..c1d76be
+--- /dev/null
++++ b/tests/test_cycles.py
+@@ -0,0 +1,99 @@
++"""Regression coverage for observed late GitHub schedule runs."""
++from datetime import datetime, timezone
++from unittest.mock import Mock, patch
++import os
++from pathlib import Path
++import tempfile
++from test_digest import payload
++import unittest
++import digest as d
++from test_digest import ENV
++
++
++def t(s):
++    return datetime.fromisoformat(s.replace('Z', '+00:00'))
++
++
++class CycleTests(unittest.TestCase):
++    def guard(self, current, previous=None, step=None, now=None, previous_event='schedule'):
++        current_run = {'id': 20, 'workflow_id': 77, 'event': 'schedule', 'created_at': current}
++        runs = [current_run]
++        if previous:
++            runs.append({'id': 19, 'event': previous_event, 'created_at': previous})
++        responses = [current_run, {'total_count': len(runs), 'workflow_runs': runs}]
++        if previous:
++            responses.append({'total_count': 1, 'jobs': [{'steps': [step or {
++                'name': d.DELIVERY_STEP, 'started_at': previous, 'conclusion': 'success'}]}]})
++        now = t(now or current)
++        return d.guard_github(now.astimezone(d.SHANGHAI).date().isoformat(),
++                              {**ENV, 'GITHUB_EVENT_NAME': 'schedule'}, Mock(side_effect=responses),
++                              now=now, with_cycle=True)
++
++    def test_midnight_delay_does_not_reserve_following_evening(self):
++        self.assertEqual(self.guard('2026-10-11T12:00:00Z', '2026-10-10T17:01:59Z'),
++                         ('scheduled', '2026-10-11'))
++
++    def test_second_observed_midnight_delay_next_evening(self):
++        self.assertEqual(self.guard('2026-10-12T12:00:00Z', '2026-10-11T17:25:00Z'),
++                         ('scheduled', '2026-10-12'))
++
++    def test_late_run_uses_previous_cycle_actual_fetch_date_unchanged(self):
++        self.assertEqual(self.guard('2026-10-11T17:25:00Z'), ('scheduled', '2026-10-11'))
++
++    def test_same_cycle_blocked_even_failed_or_unknown(self):
++        for conclusion in ['failure', 'cancelled', 'success', None]:
++            with self.subTest(conclusion=conclusion), self.assertRaises(d.SafeError):
++                self.guard('2026-10-11T17:25:00Z', '2026-10-11T12:00:00Z',
++                           {'name': d.DELIVERY_STEP, 'started_at': '2026-10-11T12:01:00Z',
++                            'conclusion': conclusion})
++
++    def test_queue_crossing_twenty_oclock_stops(self):
++        with self.assertRaises(d.SafeError):
++            self.guard('2026-10-11T11:59:00Z', now='2026-10-11T12:01:00Z')
++
++    def test_history_bound_to_creation_not_late_step(self):
++        with self.assertRaises(d.SafeError):
++            self.guard('2026-10-11T12:05:00Z', '2026-10-11T11:58:00Z',
++                {'name': d.DELIVERY_STEP, 'started_at': '2026-10-11T12:00:01Z', 'conclusion': 'success'})
++
++    def test_manual_history_independent(self):
++        self.assertEqual(self.guard('2026-10-11T12:05:00Z', '2026-10-11T12:01:00Z', previous_event='workflow_dispatch'),
++                         ('scheduled', '2026-10-11'))
++
++    def test_missing_creation_time_fails_closed(self):
++        with self.assertRaises(d.SafeError):
++            self.guard(None, now='2026-10-11T12:05:00Z')
++
++    def test_boundary_and_custom_morning_hour(self):
++        for raw, expected in [('2026-10-11T11:59:59Z', '2026-10-10'),
++                              ('2026-10-11T12:00:00Z', '2026-10-11'),
++                              ('2026-10-11T16:00:00Z', '2026-10-11')]:
++            self.assertEqual(d.scheduled_cycle(t(raw)), expected)
++        self.assertEqual(d.scheduled_cycle(t('2026-10-12T02:00:00Z'), 10), '2026-10-12')
++
++
++class DeliveryBoundaryTests(unittest.TestCase):
++    def test_stop_remaining_chunks_at_twenty_oclock(self):
++        p = payload()
++        p['messages'] = ['first', 'second']
++        before, after = t('2026-10-10T11:59:59Z'), t('2026-10-10T12:00:00Z')
++        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV), \
++             patch.object(d, 'validate_delivery'), \
++             patch.object(d, 'guard_github', return_value=('scheduled', '2026-10-09')), \
++             patch.object(d, 'datetime') as clock, patch.object(d.time, 'sleep'), \
++             patch.object(d, 'send_message') as send:
++            clock.now.side_effect = [before, before, after, after]
++            with self.assertRaises(d.SafeError):
++                d.deliver(p, tmp, before)
++            self.assertEqual(send.call_count, 1)
++            self.assertTrue((Path(tmp)/'2026-10-09.scheduled.json').exists())
++
++    def test_missing_historical_creation_fails_closed(self):
++        current = {'id': 20, 'event':'schedule', 'workflow_id':77, 'created_at':'2026-10-11T12:05:00Z'}
++        for bad in [None, 'bad', '2026-10-11T12:00:00']:
++            get = Mock(side_effect=[current, {'total_count':2, 'workflow_runs':[current,
++                {'id':19, 'event':'schedule', 'created_at':bad}]},
++                {'total_count':1, 'jobs':[{'steps':[{'name':d.DELIVERY_STEP,
++                    'started_at':'2026-10-11T12:00:00Z','conclusion':'success'}]}]}])
++            with self.subTest(bad=bad), self.assertRaises(d.SafeError):
++                d.guard_github('2026-10-11', {**ENV,'GITHUB_EVENT_NAME':'schedule'}, get)
+diff --git a/tests/test_digest.py b/tests/test_digest.py
+index 0e0de41..ab38c6c 100644
+--- a/tests/test_digest.py
++++ b/tests/test_digest.py
+@@ -153,8 +153,8 @@ class GateTests(unittest.TestCase):
+ class DedupTests(unittest.TestCase):
+     def make_get(self, step=None, total_count=2, current_event="workflow_dispatch", previous_event="workflow_dispatch"):
+         jobs = [{"steps": [step] if step else []}]
+-        return Mock(side_effect=[{"workflow_id": 77, "event": current_event},
+-            {"total_count": total_count, "workflow_runs": [{"id": 20, "event": current_event}, {"id": 19, "event": previous_event}]},
++        return Mock(side_effect=[{"workflow_id": 77, "event": current_event, "created_at": NOW.isoformat()},
++            {"total_count": total_count, "workflow_runs": [{"id": 20, "event": current_event}, {"id": 19, "event": previous_event, "created_at": NOW.isoformat()}]},
+             {"total_count": 1, "jobs": jobs}])
+ 
+     def test_previous_same_day_attempt_blocks_even_failure(self):
+@@ -277,7 +277,7 @@ class TransportTests(unittest.TestCase):
+         p = payload()
+         p["messages"] = ["one", "two", "three"]
+         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV, clear=True), \
+-             patch.object(d, "validate_delivery"), patch.object(d, "guard_github", return_value="manual-test"), \
++             patch.object(d, "validate_delivery"), patch.object(d, "guard_github", return_value=("manual-test", "2026-10-10")), \
+              patch.object(d, "datetime") as dt, patch.object(d.time, "sleep"), \
+              patch.object(d, "send_message", side_effect=[None, d.SafeError("uncertain")]) as send:
+             dt.now.return_value = NOW
+@@ -296,7 +296,7 @@ class TransportTests(unittest.TestCase):
+     def test_local_reservations_are_separate_and_each_class_blocks_repeats(self):
+         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV, clear=True), \
+              patch.object(d, "validate_delivery"), \
+-             patch.object(d, "guard_github", side_effect=["manual-test", "scheduled", "manual-test", "scheduled"]), \
++             patch.object(d, "guard_github", side_effect=[("manual-test", "2026-10-10"), ("scheduled", "2026-10-10")] * 2), \
+              patch.object(d, "datetime") as dt, patch.object(d, "send_message") as send, \
+              contextlib.redirect_stdout(io.StringIO()):
+             dt.now.return_value = NOW
+@@ -314,7 +314,7 @@ class TransportTests(unittest.TestCase):
+     def test_legacy_unclassified_local_reservation_blocks_both_classes(self):
+         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV, clear=True), \
+              patch.object(d, "validate_delivery"), \
+-             patch.object(d, "guard_github", side_effect=["manual-test", "scheduled"]), \
++             patch.object(d, "guard_github", side_effect=[("manual-test", "2026-10-10"), ("scheduled", "2026-10-10")]), \
+              patch.object(d, "send_message") as send:
+             (Path(tmp) / "2026-10-10.json").write_text('{"status":"sending"}')
+             for kind in ["manual-test", "scheduled"]:

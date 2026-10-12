@@ -153,8 +153,8 @@ class GateTests(unittest.TestCase):
 class DedupTests(unittest.TestCase):
     def make_get(self, step=None, total_count=2, current_event="workflow_dispatch", previous_event="workflow_dispatch"):
         jobs = [{"steps": [step] if step else []}]
-        return Mock(side_effect=[{"workflow_id": 77, "event": current_event},
-            {"total_count": total_count, "workflow_runs": [{"id": 20, "event": current_event}, {"id": 19, "event": previous_event}]},
+        return Mock(side_effect=[{"workflow_id": 77, "event": current_event, "created_at": NOW.isoformat()},
+            {"total_count": total_count, "workflow_runs": [{"id": 20, "event": current_event}, {"id": 19, "event": previous_event, "created_at": NOW.isoformat()}]},
             {"total_count": 1, "jobs": jobs}])
 
     def test_previous_same_day_attempt_blocks_even_failure(self):
@@ -277,7 +277,7 @@ class TransportTests(unittest.TestCase):
         p = payload()
         p["messages"] = ["one", "two", "three"]
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV, clear=True), \
-             patch.object(d, "validate_delivery"), patch.object(d, "guard_github", return_value="manual-test"), \
+             patch.object(d, "validate_delivery"), patch.object(d, "guard_github", return_value=("manual-test", "2026-10-10")), \
              patch.object(d, "datetime") as dt, patch.object(d.time, "sleep"), \
              patch.object(d, "send_message", side_effect=[None, d.SafeError("uncertain")]) as send:
             dt.now.return_value = NOW
@@ -296,7 +296,7 @@ class TransportTests(unittest.TestCase):
     def test_local_reservations_are_separate_and_each_class_blocks_repeats(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV, clear=True), \
              patch.object(d, "validate_delivery"), \
-             patch.object(d, "guard_github", side_effect=["manual-test", "scheduled", "manual-test", "scheduled"]), \
+             patch.object(d, "guard_github", side_effect=[("manual-test", "2026-10-10"), ("scheduled", "2026-10-10")] * 2), \
              patch.object(d, "datetime") as dt, patch.object(d, "send_message") as send, \
              contextlib.redirect_stdout(io.StringIO()):
             dt.now.return_value = NOW
@@ -314,7 +314,7 @@ class TransportTests(unittest.TestCase):
     def test_legacy_unclassified_local_reservation_blocks_both_classes(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV, clear=True), \
              patch.object(d, "validate_delivery"), \
-             patch.object(d, "guard_github", side_effect=["manual-test", "scheduled"]), \
+             patch.object(d, "guard_github", side_effect=[("manual-test", "2026-10-10"), ("scheduled", "2026-10-10")]), \
              patch.object(d, "send_message") as send:
             (Path(tmp) / "2026-10-10.json").write_text('{"status":"sending"}')
             for kind in ["manual-test", "scheduled"]:
@@ -343,3 +343,4 @@ class TransportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

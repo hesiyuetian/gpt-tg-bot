@@ -54,3 +54,11 @@ python3 digest.py build --out out/live
 主要文件：`digest.py`、`.github/workflows/digest.yml`、`tests/`。`chinese_overrides.json` 默认为空，原文模式不需要修改；可选的人工译文只在原文哈希一致时应用，不调用自动翻译。
 
 本地测试和真实 GitHub 抓取已验证；真实 Actions、Telegram 配对和收件需要按上方步骤完成，不能仅凭本地测试认为已上线成功。
+
+
+## 新增：A股早盘规则观察与跨日去重修复
+
+- A股有限观察池简报说明、时间安全与维护要求：[docs/ASHARE_BRIEF.md](docs/ASHARE_BRIEF.md)。手动工作流仅预览；默认分支的独立定时工作流沿用现有私聊secrets。
+- 晚间日报按最近已到达的北京时间20:00计划周期去重，实际抓取日期仍独立保留。凌晨延迟运行属于前一晚周期，不占当晚名额。
+- GitHub不提供可靠的原定cron日期；以run.created_at映射可观测周期，不能还原超过24小时延迟的原始计划。排队跨越20:00停止；历史旧运行的创建周期及实际发送步骤周期都保守保留，避免未知结果重发。手动测试仍按自然日单独去重。
+- Actions使用干净runner；不要未经核对复用旧版持久化 `delivery-state` 文件。旧版本地文件的自然日含义与新计划周期不同，迁移前需核对真实投递情况。

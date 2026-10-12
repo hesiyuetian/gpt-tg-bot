@@ -274,8 +274,20 @@ def delivery_class(event):
     raise SafeError("运行事件未知；无法确认去重类别，已停止。")
 
 
-def guard_github(date, env=None, get=None):
-    """An earlier delivery step reserves this date within its event class.
+def scheduled_cycle(at, hour=20):
+    """Most recent Shanghai schedule boundary, not the quote/fetch date.
+
+    GitHub does not expose the intended cron occurrence. Bind to run.created_at
+    so queueing and reruns cannot move a reservation. Delays of >=24 hours
+    cannot be reconstructed; this is a conservative observable cycle policy.
+    """
+    local = at.astimezone(SHANGHAI)
+    boundary = local.replace(hour=hour, minute=0, second=0, microsecond=0)
+    return (local.date() if local >= boundary else (local - timedelta(days=1)).date()).isoformat()
+
+
+def guard_github(date, env=None, get=None, *, schedule_hour=20, now=None, with_cycle=False):
+    """An earlier delivery step reserves its run cycle within its event class.
 
     Serialized workflow + read-only history avoids repository write permissions.
     A started but failed/cancelled step may already have delivered, so block it.
@@ -292,6 +304,9 @@ def guard_github(date, env=None, get=None):
     kind = delivery_class(current.get("event"))
     if current.get("event") != env.get("GITHUB_EVENT_NAME"):
         raise SafeError("运行事件与 Actions 上下文不一致，已停止。")
+    cycle = scheduled_cycle(parse_time(current.get("created_at")), schedule_hour) if kind == "scheduled" else date
+    if now is not None and kind == "scheduled" and cycle != scheduled_cycle(now, schedule_hour):
+        raise SafeError("运行排队跨越计划周期，已停止，避免占用下一周期或重复投递。")
     workflow_id = current.get("workflow_id")
     if not isinstance(workflow_id, int):
         raise SafeError("无法确认当前 workflow。")
@@ -333,10 +348,20 @@ def guard_github(date, env=None, get=None):
                 started = step.get("started_at")
                 if not started and step.get("status") != "queued":
                     raise SafeError("发送步骤缺少时间记录；为避免重复，已停止。")
-                same_day = started and parse_time(started).astimezone(SHANGHAI).date().isoformat() == date
-                if same_day and other_kind == kind:
-                    raise SafeError("今天已有同类发送步骤启动，可能已送达或部分送达；已拦截重复发送，请先检查 Telegram。")
-    return kind
+                # Validate even the other event class; incomplete history fails closed.
+                if started:
+                    step_time = parse_time(started)
+                    other_cycle = (scheduled_cycle(parse_time(run.get("created_at")), schedule_hour)
+                                   if other_kind == "scheduled" else step_time.astimezone(SHANGHAI).date().isoformat())
+                else:
+                    other_cycle = None
+                # Legacy code could send after its creation cycle ended. Its
+                # actual delivery cycle also remains reserved conservatively.
+                actual_cycle = (scheduled_cycle(step_time, schedule_hour)
+                                if started and other_kind == "scheduled" else other_cycle)
+                if cycle in (other_cycle, actual_cycle) and other_kind == kind:
+                    raise SafeError("本计划周期已有同类发送步骤启动，可能已送达或部分送达；已拦截重复发送，请先检查 Telegram。")
+    return (kind, cycle) if with_cycle else kind
 
 
 def validate_delivery(payload, now, env=None):
@@ -389,13 +414,13 @@ def send_message(token, chat_id, text, opener=None):
 def deliver(payload, state_dir, now=None):
     now = now or datetime.now(timezone.utc)
     validate_delivery(payload, now)
-    kind = guard_github(payload["date"])
+    kind, cycle = guard_github(payload["date"], now=now, with_cycle=True)
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     if (state_dir / (payload["date"] + ".json")).exists():
         raise SafeError("本地已有未分类的当日发送记录；请先核对收件情况。")
-    state_path = state_dir / (payload["date"] + "." + kind + ".json")
-    state = {"date": payload["date"], "delivery_class": kind, "status": "reserved", "confirmed_chunks": 0,
+    state_path = state_dir / (cycle + "." + kind + ".json")
+    state = {"date": payload["date"], "cycle": cycle, "delivery_class": kind, "status": "reserved", "confirmed_chunks": 0,
              "total_chunks": len(payload["messages"])}
     try:
         with state_path.open("x", encoding="utf-8") as f:
@@ -406,6 +431,8 @@ def deliver(payload, state_dir, now=None):
         # Stop rather than let a day-boundary split evade the date guard.
         if datetime.now(timezone.utc).astimezone(SHANGHAI).date().isoformat() != payload["date"]:
             raise SafeError("发送跨越北京时间午夜，已停止剩余分段，请核对收件情况。")
+        if kind == "scheduled" and scheduled_cycle(datetime.now(timezone.utc)) != cycle:
+            raise SafeError("发送跨越计划周期，已停止剩余分段，请核对收件情况。")
         state["status"] = "sending"
         state_path.write_text(json.dumps(state), encoding="utf-8")
         send_message(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"], message)
@@ -453,3 +480,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

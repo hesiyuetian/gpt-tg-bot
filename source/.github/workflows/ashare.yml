@@ -1,0 +1,46 @@
+name: A-share morning Telegram brief
+
+on:
+  schedule:
+    - cron: '0 2 * * 1-5' # 10:00 Asia/Shanghai; exchange calendar is checked in code.
+  workflow_dispatch: # Preview only; never sends Telegram.
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ashare-telegram-private-chat
+  cancel-in-progress: false
+
+jobs:
+  brief:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Test without credentials
+        run: python3 -m unittest discover -s tests -v
+      - name: Build current brief or skip closed/late session
+        run: python3 ashare.py build
+      - name: Show preview
+        run: |
+          python3 - <<'PYCODE'
+          import html, os
+          from pathlib import Path
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('<h2>A股量价观察预览</h2><pre>' + html.escape(Path('out/ashare/preview.txt').read_text(encoding='utf-8')) + '</pre>')
+          PYCODE
+      # Existing history-based guard recognizes this exact name in this workflow.
+      - name: Delivery attempt (do not rename)
+        if: github.event_name == 'schedule' && vars.ASHARE_DISABLED != 'true'
+        env:
+          ASHARE_ENABLED: 'true'
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 ashare.py send
